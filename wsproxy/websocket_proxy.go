@@ -225,6 +225,9 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	// read loop -- take messages from websocket and write to http request
+	bufIn := make(chan []byte)
+	bufOut := make(chan []byte)
+
 	go func() {
 		if p.pingInterval > 0 && p.pingWait > 0 && p.pongWait > 0 {
 			conn.SetReadDeadline(time.Now().Add(p.pongWait))
@@ -232,6 +235,7 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 		}
 		defer func() {
 			cancelFn()
+			close(bufIn)
 		}()
 		for {
 			select {
@@ -250,17 +254,72 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 				p.logger.Warnln("error reading websocket message:", err)
 				return
 			}
-			p.logger.Debugln("[read] read payload:", string(payload))
-			p.logger.Debugln("[read] writing to requestBody:")
-			n, err := requestBodyW.Write(payload)
-			requestBodyW.Write([]byte("\n"))
-			p.logger.Debugln("[read] wrote to requestBody", n)
-			if err != nil {
-				p.logger.Warnln("[read] error writing message to upstream http server:", err)
-				return
+			bufIn <- payload
+		}
+	}()
+
+	// Buffer goroutine between conn and request.
+	// TODO: add memory limit so connection is closed if client is too fast
+	// TODO: use more efficient deque implementation instead of slice
+	go func() {
+		defer func() {
+			cancelFn()
+		}()
+		defer close(bufOut)
+		buf := [][]byte{}
+		for {
+			if len(buf) > 0 {
+				select {
+				case msg, ok := <-bufIn:
+					if !ok {
+						return
+					}
+					buf = append(buf, msg)
+				case bufOut <- buf[0]:
+					buf = buf[1:]
+				case <-ctx.Done():
+					return
+				}
+			} else {
+				select {
+				case msg, ok := <-bufIn:
+					if !ok {
+						return
+					}
+					buf = append(buf, msg)
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 	}()
+
+	go func() {
+		defer func() {
+			cancelFn()
+		}()
+		for {
+			select {
+			case payload, ok := <-bufOut:
+				if !ok {
+					return
+				}
+				p.logger.Debugln("[read] read payload:", string(payload))
+				p.logger.Debugln("[read] writing to requestBody:")
+				n, err := requestBodyW.Write(payload)
+				requestBodyW.Write([]byte("\n"))
+				p.logger.Debugln("[read] wrote to requestBody", n)
+				if err != nil {
+					p.logger.Warnln("[read] error writing message to upstream http server:", err)
+					return
+				}
+			case <-ctx.Done():
+				p.logger.Debugln("write loop done")
+			}
+		}
+	}()
+	//
+
 	// ping write loop
 	if p.pingInterval > 0 && p.pingWait > 0 && p.pongWait > 0 {
 		go func() {
