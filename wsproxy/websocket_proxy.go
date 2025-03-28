@@ -13,12 +13,22 @@ import (
 	"golang.org/x/net/context"
 )
 
-// MethodOverrideParam defines the special URL parameter that is translated into the subsequent proxied streaming http request's method.
-//
-// Deprecated: it is preferable to use the Options parameters to WebSocketProxy to supply parameters.
-var MethodOverrideParam = "method"
+var (
+	// MethodOverrideParam defines the special URL parameter that is translated into the subsequent
+	// proxied streaming http request's method.
+	//
+	// Deprecated: it is preferable to use the Options parameters to WebSocketProxy to supply parameters.
+	MethodOverrideParam = "method"
 
-var MethodTypeParam = "methodType"
+	// defaultMethodTypeParam defines the default URL parameter name for the special parameter that is
+	// translated into the subsequent proxied streaming http request's gRPC method type.
+	defaultMethodTypeParam = "methodType"
+
+	// defaultMethodRequestBodyParam defines the default URL parameter name for the special parameter that is
+	// translated into the boolean representing whether or not the proxied streaming http request's body
+	// should be included in the request.
+	defaultMethodRequestBodyParam = "body"
+)
 
 // TokenCookieName defines the cookie name that is translated to an 'Authorization: Bearer' header in the streaming http request's headers.
 //
@@ -35,6 +45,7 @@ type Proxy struct {
 	maxRespBodyBufferBytes int
 	methodOverrideParam    string
 	methodTypeParam        string
+	methodRequestBodyParam string
 	tokenCookieName        string
 	requestMutator         RequestMutatorFunc
 	headerForwarder        func(header string) bool
@@ -176,12 +187,13 @@ func defaultHeaderForwarder(header string) bool {
 // Method can be overwritten with the MethodOverrideParam get parameter in the requested URL
 func WebsocketProxy(h http.Handler, opts ...Option) http.Handler {
 	p := &Proxy{
-		h:                   h,
-		logger:              logrus.New(),
-		methodOverrideParam: MethodOverrideParam,
-		methodTypeParam:     MethodTypeParam,
-		tokenCookieName:     TokenCookieName,
-		headerForwarder:     defaultHeaderForwarder,
+		h:                      h,
+		logger:                 logrus.New(),
+		methodOverrideParam:    MethodOverrideParam,
+		methodTypeParam:        defaultMethodTypeParam,
+		methodRequestBodyParam: defaultMethodRequestBodyParam,
+		tokenCookieName:        TokenCookieName,
+		headerForwarder:        defaultHeaderForwarder,
 	}
 	for _, o := range opts {
 		o(p)
@@ -207,6 +219,8 @@ func isClosedConnError(err error) bool {
 func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 	var responseHeader http.Header
 	var methodType MethodType
+	var requestBody bool
+
 	// If Sec-WebSocket-Protocol starts with "Bearer", respond in kind.
 	// TODO(tmc): consider customizability/extension point here.
 	if strings.HasPrefix(r.Header.Get("Sec-WebSocket-Protocol"), "Bearer") {
@@ -248,7 +262,21 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 	if m := r.URL.Query().Get(p.methodTypeParam); m != "" {
 		methodType = MethodType(m)
 		if !methodType.IsValid() {
-			p.logger.Warnln("invalid method type:", m)
+			p.logger.Warnln("invalid", p.methodTypeParam, "parameter:", m,
+				"expected one of:", MethodTypeUnary, MethodTypeClientStreaming,
+				MethodTypeServerStreaming, MethodTypeBidiStreaming)
+			return
+		}
+	}
+	if m := r.URL.Query().Get(p.methodRequestBodyParam); m != "" {
+		switch m {
+		case "true":
+			requestBody = true
+		case "false":
+			requestBody = false
+		default:
+			p.logger.Warnln("invalid", p.methodRequestBodyParam, "parameter:", m,
+				"expected one of: true, false")
 			return
 		}
 	}
@@ -289,24 +317,26 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 				return
 			default:
 			}
-			p.logger.Debugln("[read] reading from socket.")
-			_, payload, err := conn.ReadMessage()
-			if err != nil {
-				if isClosedConnError(err) {
-					p.logger.Debugln("[read] websocket closed:", err)
+			if requestBody {
+				p.logger.Debugln("[read] reading from socket.")
+				_, payload, err := conn.ReadMessage()
+				if err != nil {
+					if isClosedConnError(err) {
+						p.logger.Debugln("[read] websocket closed:", err)
+						return
+					}
+					p.logger.Warnln("error reading websocket message:", err)
 					return
 				}
-				p.logger.Warnln("error reading websocket message:", err)
-				return
-			}
-			p.logger.Debugln("[read] read payload:", string(payload))
-			p.logger.Debugln("[read] writing to requestBody:")
-			n, err := requestBodyW.Write(payload)
-			requestBodyW.Write([]byte("\n"))
-			p.logger.Debugln("[read] wrote to requestBody", n)
-			if err != nil {
-				p.logger.Warnln("[read] error writing message to upstream http server:", err)
-				return
+				p.logger.Debugln("[read] read payload:", string(payload))
+				p.logger.Debugln("[read] writing to requestBody:")
+				n, err := requestBodyW.Write(payload)
+				requestBodyW.Write([]byte("\n"))
+				p.logger.Debugln("[read] wrote to requestBody", n)
+				if err != nil {
+					p.logger.Warnln("[read] error writing message to upstream http server:", err)
+					return
+				}
 			}
 			// Close request body since server doesn't expect any more data
 			requestBodyW.Close()
