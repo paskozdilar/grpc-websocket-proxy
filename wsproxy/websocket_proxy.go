@@ -32,6 +32,7 @@ type Proxy struct {
 	logger                 Logger
 	maxRespBodyBufferBytes int
 	methodOverrideParam    string
+	methodTypeParam        string
 	tokenCookieName        string
 	requestMutator         RequestMutatorFunc
 	headerForwarder        func(header string) bool
@@ -44,6 +45,28 @@ type Proxy struct {
 type Logger interface {
 	Warnln(...interface{})
 	Debugln(...interface{})
+}
+
+// MethodType defines the type of gRPC method.
+type MethodType string
+
+const (
+	MethodTypeUnary           MethodType = "Unary"
+	MethodTypeClientStreaming MethodType = "ClientStreaming"
+	MethodTypeServerStreaming MethodType = "ServerStreaming"
+	MethodTypeBidiStreaming   MethodType = "BidiStreaming"
+)
+
+func (mt MethodType) String() string {
+	return string(mt)
+}
+
+func (mt MethodType) IsValid() bool {
+	switch mt {
+	case MethodTypeUnary, MethodTypeClientStreaming, MethodTypeServerStreaming, MethodTypeBidiStreaming:
+		return true
+	}
+	return false
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -70,6 +93,14 @@ func WithMaxRespBodyBufferSize(nBytes int) Option {
 func WithMethodParamOverride(param string) Option {
 	return func(p *Proxy) {
 		p.methodOverrideParam = param
+	}
+}
+
+// WithMethodTypeParam allows specification of gRPC method type.
+// Allowed values are "Unary", "ClientStreaming", "ServerStreaming", "BidiStreaming".
+func WithMethodTypeParam(param string) Option {
+	return func(p *Proxy) {
+		p.methodTypeParam = param
 	}
 }
 
@@ -130,9 +161,12 @@ func defaultHeaderForwarder(header string) bool {
 // The cookie name is specified by the TokenCookieName value.
 //
 // example:
-//   Sec-Websocket-Protocol: Bearer, foobar
+//
+//	Sec-Websocket-Protocol: Bearer, foobar
+//
 // is converted to:
-//   Authorization: Bearer foobar
+//
+//	Authorization: Bearer foobar
 //
 // Method can be overwritten with the MethodOverrideParam get parameter in the requested URL
 func WebsocketProxy(h http.Handler, opts ...Option) http.Handler {
@@ -166,6 +200,7 @@ func isClosedConnError(err error) bool {
 
 func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 	var responseHeader http.Header
+	var methodType MethodType
 	// If Sec-WebSocket-Protocol starts with "Bearer", respond in kind.
 	// TODO(tmc): consider customizability/extension point here.
 	if strings.HasPrefix(r.Header.Get("Sec-WebSocket-Protocol"), "Bearer") {
@@ -204,6 +239,13 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 	if m := r.URL.Query().Get(p.methodOverrideParam); m != "" {
 		request.Method = m
 	}
+	if m := r.URL.Query().Get(p.methodTypeParam); m != "" {
+		methodType = MethodType(m)
+		if !methodType.IsValid() {
+			p.logger.Warnln("invalid method type:", m)
+			return
+		}
+	}
 
 	if p.requestMutator != nil {
 		request = p.requestMutator(r, request)
@@ -225,19 +267,16 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	// read loop -- take messages from websocket and write to http request
-	bufIn := make(chan []byte)
-	bufOut := make(chan []byte)
-
-	go func() {
-		if p.pingInterval > 0 && p.pingWait > 0 && p.pongWait > 0 {
-			conn.SetReadDeadline(time.Now().Add(p.pongWait))
-			conn.SetPongHandler(func(string) error { conn.SetReadDeadline(time.Now().Add(p.pongWait)); return nil })
-		}
-		defer func() {
-			cancelFn()
-			close(bufIn)
-		}()
-		for {
+	switch methodType {
+	case MethodTypeUnary, MethodTypeServerStreaming:
+		go func() {
+			if p.pingInterval > 0 && p.pingWait > 0 && p.pongWait > 0 {
+				conn.SetReadDeadline(time.Now().Add(p.pongWait))
+				conn.SetPongHandler(func(string) error { conn.SetReadDeadline(time.Now().Add(p.pongWait)); return nil })
+			}
+			defer func() {
+				cancelFn()
+			}()
 			select {
 			case <-ctx.Done():
 				p.logger.Debugln("read loop done")
@@ -254,54 +293,56 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 				p.logger.Warnln("error reading websocket message:", err)
 				return
 			}
-			bufIn <- payload
-		}
-	}()
-
-	// Buffer goroutine between conn and request.
-	// TODO: add memory limit so connection is closed if client is too fast
-	// TODO: use more efficient deque implementation instead of slice
-	go func() {
-		defer func() {
-			cancelFn()
-		}()
-		defer close(bufOut)
-		buf := [][]byte{}
-		for {
-			if len(buf) > 0 {
-				select {
-				case msg, ok := <-bufIn:
-					if !ok {
-						return
-					}
-					buf = append(buf, msg)
-				case bufOut <- buf[0]:
-					buf = buf[1:]
-				case <-ctx.Done():
-					return
-				}
-			} else {
-				select {
-				case msg, ok := <-bufIn:
-					if !ok {
-						return
-					}
-					buf = append(buf, msg)
-				case <-ctx.Done():
-					return
-				}
+			p.logger.Debugln("[read] read payload:", string(payload))
+			p.logger.Debugln("[read] writing to requestBody:")
+			n, err := requestBodyW.Write(payload)
+			requestBodyW.Write([]byte("\n"))
+			p.logger.Debugln("[read] wrote to requestBody", n)
+			if err != nil {
+				p.logger.Warnln("[read] error writing message to upstream http server:", err)
+				return
 			}
-		}
-	}()
-
-	go func() {
-		defer func() {
-			cancelFn()
+			// Close request body since server doesn't expect any more data
+			requestBodyW.Close()
+			messageType, _, err := conn.ReadMessage()
+			if err != nil {
+				if isClosedConnError(err) {
+					p.logger.Debugln("[read] websocket closed:", err)
+					return
+				}
+				p.logger.Warnln("error reading websocket message:", err)
+				return
+			}
+			if messageType == websocket.CloseMessage {
+				p.logger.Debugln("[read] websocket closed")
+				return
+			}
+			p.logger.Debugln("[read] unexpected message type:", messageType)
 		}()
-		for {
-			select {
-			case payload, ok := <-bufOut:
-				if !ok {
+	case MethodTypeClientStreaming, MethodTypeBidiStreaming:
+		go func() {
+			if p.pingInterval > 0 && p.pingWait > 0 && p.pongWait > 0 {
+				conn.SetReadDeadline(time.Now().Add(p.pongWait))
+				conn.SetPongHandler(func(string) error { conn.SetReadDeadline(time.Now().Add(p.pongWait)); return nil })
+			}
+			defer func() {
+				cancelFn()
+			}()
+			for {
+				select {
+				case <-ctx.Done():
+					p.logger.Debugln("read loop done")
+					return
+				default:
+				}
+				p.logger.Debugln("[read] reading from socket.")
+				_, payload, err := conn.ReadMessage()
+				if err != nil {
+					if isClosedConnError(err) {
+						p.logger.Debugln("[read] websocket closed:", err)
+						return
+					}
+					p.logger.Warnln("error reading websocket message:", err)
 					return
 				}
 				p.logger.Debugln("[read] read payload:", string(payload))
@@ -313,12 +354,9 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 					p.logger.Warnln("[read] error writing message to upstream http server:", err)
 					return
 				}
-			case <-ctx.Done():
-				p.logger.Debugln("write loop done")
 			}
-		}
-	}()
-	//
+		}()
+	}
 
 	// ping write loop
 	if p.pingInterval > 0 && p.pingWait > 0 && p.pongWait > 0 {
@@ -397,12 +435,15 @@ func transformSubProtocolHeader(header string) string {
 func (w *inMemoryResponseWriter) Write(b []byte) (int, error) {
 	return w.Writer.Write(b)
 }
+
 func (w *inMemoryResponseWriter) Header() http.Header {
 	return w.header
 }
+
 func (w *inMemoryResponseWriter) WriteHeader(code int) {
 	w.code = code
 }
+
 func (w *inMemoryResponseWriter) CloseNotify() <-chan bool {
 	return w.closed
 }
