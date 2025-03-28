@@ -219,7 +219,7 @@ func isClosedConnError(err error) bool {
 func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 	var responseHeader http.Header
 	var methodType MethodType
-	var requestBody bool
+	requestBody := true
 
 	// If Sec-WebSocket-Protocol starts with "Bearer", respond in kind.
 	// TODO(tmc): consider customizability/extension point here.
