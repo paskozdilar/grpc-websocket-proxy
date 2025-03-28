@@ -18,6 +18,8 @@ import (
 // Deprecated: it is preferable to use the Options parameters to WebSocketProxy to supply parameters.
 var MethodOverrideParam = "method"
 
+var MethodTypeParam = "methodType"
+
 // TokenCookieName defines the cookie name that is translated to an 'Authorization: Bearer' header in the streaming http request's headers.
 //
 // Deprecated: it is preferable to use the Options parameters to WebSocketProxy to supply parameters.
@@ -97,7 +99,10 @@ func WithMethodParamOverride(param string) Option {
 }
 
 // WithMethodTypeParam allows specification of gRPC method type.
-// Allowed values are "Unary", "ClientStreaming", "ServerStreaming", "BidiStreaming".
+// Default name of the query parameter is "methodType".
+//
+// The query parameter expects one of the values:
+// "Unary", "ClientStreaming", "ServerStreaming", "BidiStreaming".
 func WithMethodTypeParam(param string) Option {
 	return func(p *Proxy) {
 		p.methodTypeParam = param
@@ -174,6 +179,7 @@ func WebsocketProxy(h http.Handler, opts ...Option) http.Handler {
 		h:                   h,
 		logger:              logrus.New(),
 		methodOverrideParam: MethodOverrideParam,
+		methodTypeParam:     MethodTypeParam,
 		tokenCookieName:     TokenCookieName,
 		headerForwarder:     defaultHeaderForwarder,
 	}
