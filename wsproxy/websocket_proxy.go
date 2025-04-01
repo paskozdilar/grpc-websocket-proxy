@@ -317,6 +317,13 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 			p.logger.Warnln("[write] error writing websocket message:", err)
 			return
 		}
+		if grpcMethodType == "Unary" || grpcMethodType == "ClientStreaming" {
+			// Close WebSocket
+			if err = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")); err != nil {
+				p.logger.Warnln("[write] error writing websocket close message:", err)
+				return
+			}
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		p.logger.Warnln("scanner err:", err)
